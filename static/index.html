@@ -9,6 +9,10 @@
     main { max-width: 820px; margin: auto; }
     pre { background: #f3f4f6; padding: 1rem; border-radius: 8px; overflow-x: auto; }
     button { padding: .5rem .8rem; cursor: pointer; }
+    input { padding: .4rem; margin: .2rem; }
+    table { border-collapse: collapse; margin-top: .5rem; }
+    th, td { border: 1px solid #d1d5db; padding: .3rem .6rem; }
+    #usage p { font-weight: 600; }
   </style>
 </head>
 <body>
@@ -16,6 +20,20 @@
   <h1>基因组数据访问治理</h1>
   <p>这是最小演示页面。使用浏览器或 curl 调用 JSON API。</p>
   <p><button onclick="checkHealth()">检查服务状态</button></p>
+
+  <h2>取用台账</h2>
+  <p>
+    <label>凭证ID <input id="grantId" size="38" placeholder="grant 实体ID"></label>
+    <button onclick="loadUsage()">查询用量</button>
+  </p>
+  <div id="usage"></div>
+  <p>
+    <input id="orderNo" placeholder="取用单号">
+    <input id="amount" type="number" min="0" step="any" placeholder="本次数量">
+    <input id="purpose" placeholder="用途">
+    <button onclick="submitWithdrawal()">提交取用</button>
+  </p>
+
   <pre id="result">等待操作</pre>
   <h2>常用接口</h2>
   <pre>GET  /health
@@ -25,9 +43,71 @@ GET  /api/entities/&lt;id&gt;
 POST /api/entities/&lt;id&gt;/actions</pre>
 </main>
 <script>
+function esc(value) {
+  return String(value == null ? '' : value).replace(/[&<>"']/g,
+    ch => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[ch]));
+}
+
+function show(value) {
+  document.getElementById('result').textContent =
+    typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+}
+
 async function checkHealth() {
   const response = await fetch('/health');
-  document.getElementById('result').textContent = JSON.stringify(await response.json(), null, 2);
+  show(await response.json());
+}
+
+function renderUsage(entity) {
+  const data = entity.data || {};
+  const quota = data.quota_total || 0;
+  const used = data.used_total || 0;
+  const rows = (data.withdrawals || []).map(w =>
+    '<tr><td>' + esc(w.order_no) + '</td><td>' + esc(w.amount) + '</td><td>' +
+    esc(w.purpose) + '</td><td>' + esc(w.recorded_by) + '</td><td>' +
+    esc(w.recorded_at) + '</td></tr>').join('');
+  document.getElementById('usage').innerHTML =
+    '<p>状态：' + esc(entity.status) +
+    ' ｜ 可取用总量：' + esc(quota) +
+    ' ｜ 累计用量：' + esc(used) +
+    ' ｜ 余量：' + esc(quota - used) + '</p>' +
+    (rows
+      ? '<table><tr><th>取用单号</th><th>数量</th><th>用途</th><th>提交人</th><th>时间</th></tr>' + rows + '</table>'
+      : '<p>暂无取用记录</p>');
+}
+
+async function loadUsage() {
+  const id = document.getElementById('grantId').value.trim();
+  if (!id) return show('请填写凭证ID');
+  const response = await fetch('/api/entities/' + encodeURIComponent(id));
+  const entity = await response.json();
+  show(entity);
+  if (response.ok) renderUsage(entity);
+}
+
+async function submitWithdrawal() {
+  const id = document.getElementById('grantId').value.trim();
+  if (!id) return show('请填写凭证ID');
+  const body = {
+    action: 'withdraw',
+    data: {
+      order_no: document.getElementById('orderNo').value.trim(),
+      amount: Number(document.getElementById('amount').value),
+      purpose: document.getElementById('purpose').value.trim()
+    }
+  };
+  const response = await fetch('/api/entities/' + encodeURIComponent(id) + '/actions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-User-Id': 'researcher-1',
+      'X-Role': 'applicant'
+    },
+    body: JSON.stringify(body)
+  });
+  const result = await response.json();
+  show(result);
+  if (response.ok) renderUsage(result);
 }
 </script>
 </body>

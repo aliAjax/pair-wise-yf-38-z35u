@@ -1,7 +1,7 @@
 from uuid import uuid4
 
 from .audit import AuditTrail
-from .domain import ConflictError, NotFoundError
+from .domain import ConflictError, DuplicateSubmission, NotFoundError
 from .rules import RuleEngine
 
 
@@ -38,25 +38,46 @@ class DomainService:
         return entity
 
     def transition(self, actor, entity_id, action, data=None, expected_version=None):
-        entity = self.repository.get_entity(entity_id)
-        if not entity:
-            raise NotFoundError("entity not found: " + entity_id)
-        expected = int(expected_version) if expected_version is not None else entity["version"]
-        next_status, patch = self.rules.validate_transition(
-            actor, entity, action, dict(data or {}), self._lookup
-        )
-        merged = dict(entity["data"])
-        merged.update(patch)
-        updated = self.repository.update_entity(entity_id, expected, next_status, merged)
-        self.audit.record(
-            entity_id,
-            actor,
-            action,
-            entity["status"],
-            updated["status"],
-            {"patch": patch},
-        )
-        return updated
+        # Without an explicit expected_version, retry on optimistic-lock
+        # conflicts so concurrent submissions are re-validated against the
+        # latest state (e.g. two withdrawals racing on the same balance).
+        attempts = 1 if expected_version is not None else 3
+        for attempt in range(attempts):
+            entity = self.repository.get_entity(entity_id)
+            if not entity:
+                raise NotFoundError("entity not found: " + entity_id)
+            expected = (
+                int(expected_version)
+                if expected_version is not None
+                else entity["version"]
+            )
+            try:
+                next_status, patch = self.rules.validate_transition(
+                    actor, entity, action, dict(data or {}), self._lookup
+                )
+            except DuplicateSubmission:
+                # Idempotent replay (e.g. same withdrawal order number):
+                # already recorded once, return current state unchanged.
+                return entity
+            merged = dict(entity["data"])
+            merged.update(patch)
+            try:
+                updated = self.repository.update_entity(
+                    entity_id, expected, next_status, merged
+                )
+            except ConflictError:
+                if attempt + 1 < attempts:
+                    continue
+                raise
+            self.audit.record(
+                entity_id,
+                actor,
+                action,
+                entity["status"],
+                updated["status"],
+                {"patch": patch},
+            )
+            return updated
 
     def get(self, entity_id):
         entity = self.repository.get_entity(entity_id)

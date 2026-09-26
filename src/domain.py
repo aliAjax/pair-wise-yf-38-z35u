@@ -23,6 +23,10 @@ class ConflictError(DomainError):
     """A version or uniqueness constraint was violated."""
 
 
+class DuplicateSubmission(DomainError):
+    """The same submission was already recorded; safe to treat as success."""
+
+
 class InvalidTransition(DomainError):
     """The requested state transition is not valid."""
 

@@ -1,7 +1,8 @@
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from .domain import (
     ConflictError,
+    DuplicateSubmission,
     InvalidTransition,
     PermissionDenied,
     ValidationError,
@@ -33,24 +34,78 @@ def valid_grant_window(expires_at, as_of):
     return str(expires_at) >= str(as_of)
 
 
+def _validate_grant(actor, data, lookup):
+    quota = data.get("quota_total")
+    if quota is None:
+        return
+    if isinstance(quota, bool) or not isinstance(quota, (int, float)):
+        raise ValidationError("quota_total must be a number")
+    if quota < 0:
+        raise ValidationError("quota_total must not be negative")
+
+
 def _validate_grant_activate(actor, entity, data, lookup):
     if data.get("expires_at") < data.get("starts_at"):
         raise ValidationError("grant expiry must be after start")
     return {"activated_by": actor.user_id}
 
 
-CUSTOM_CREATE = {'dataset': _validate_dataset, 'application': _validate_application}
-CUSTOM_TRANSITIONS = {('application', 'approve'): _validate_approve, ('grant', 'activate'): _validate_grant_activate}
+def _validate_withdraw(actor, entity, data, lookup):
+    grant = entity["data"]
+    order_no = str(data.get("order_no", "")).strip()
+    if not order_no:
+        raise ValidationError("order_no is required")
+    withdrawals = list(grant.get("withdrawals") or [])
+    for record in withdrawals:
+        if str(record.get("order_no")) == order_no:
+            raise DuplicateSubmission(
+                "withdrawal %s already recorded for this grant" % order_no
+            )
+    amount = data.get("amount")
+    if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+        raise ValidationError("amount must be a number")
+    if amount <= 0:
+        raise ValidationError("amount must be positive")
+    today = date.today().isoformat()
+    starts_at = grant.get("starts_at")
+    if starts_at and str(starts_at) > today:
+        raise ValidationError("grant is not valid until %s" % starts_at)
+    expires_at = grant.get("expires_at")
+    if expires_at and not valid_grant_window(expires_at, today):
+        raise ValidationError("grant expired at %s" % expires_at)
+    quota = grant.get("quota_total") or 0
+    used = grant.get("used_total") or 0
+    remaining = quota - used
+    if amount > remaining:
+        raise ValidationError(
+            "insufficient balance: requested %s, remaining %s, short %s"
+            % (amount, remaining, amount - remaining)
+        )
+    record = {
+        "order_no": order_no,
+        "amount": amount,
+        "purpose": data.get("purpose"),
+        "recorded_by": actor.user_id,
+        "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    return {
+        "used_total": used + amount,
+        "withdrawals": withdrawals + [record],
+    }
+
+
+CUSTOM_CREATE = {'dataset': _validate_dataset, 'application': _validate_application, 'grant': _validate_grant}
+CUSTOM_TRANSITIONS = {('application', 'approve'): _validate_approve, ('grant', 'activate'): _validate_grant_activate, ('grant', 'withdraw'): _validate_withdraw}
 
 
 class RuleEngine:
     ALIASES = {'datasets': 'dataset', 'applications': 'application', 'grants': 'grant'}
     INITIAL_STATUS = {'dataset': 'registered', 'application': 'draft', 'grant': 'issued'}
-    TRANSITIONS = {'dataset': {'restrict': (('registered',), 'restricted'), 'publish': (('restricted',), 'published')}, 'application': {'submit': (('draft',), 'submitted'), 'review': (('submitted',), 'under_review'), 'approve': (('under_review',), 'approved'), 'reject': (('under_review',), 'rejected'), 'withdraw': (('submitted', 'under_review'), 'withdrawn')}, 'grant': {'activate': (('issued',), 'active'), 'revoke': (('active',), 'revoked'), 'expire': (('active',), 'expired')}}
+    TRANSITIONS = {'dataset': {'restrict': (('registered',), 'restricted'), 'publish': (('restricted',), 'published')}, 'application': {'submit': (('draft',), 'submitted'), 'review': (('submitted',), 'under_review'), 'approve': (('under_review',), 'approved'), 'reject': (('under_review',), 'rejected'), 'withdraw': (('submitted', 'under_review'), 'withdrawn')}, 'grant': {'activate': (('issued',), 'active'), 'revoke': (('active',), 'revoked'), 'expire': (('active',), 'expired'), 'withdraw': (('active',), 'active')}}
     CREATE_REQUIRED = {'dataset': ('name', 'access_policy'), 'application': ('dataset_id', 'applicant_id', 'purpose'), 'grant': ('application_id', 'dataset_id', 'recipient')}
-    ACTION_REQUIRED = {('dataset', 'restrict'): ('reason',), ('application', 'review'): ('committee_id',), ('application', 'approve'): ('approvals', 'terms', 'expires_at'), ('application', 'reject'): ('reason',), ('application', 'withdraw'): ('reason',), ('grant', 'activate'): ('starts_at', 'expires_at'), ('grant', 'revoke'): ('reason',), ('grant', 'expire'): ('expired_at',)}
+    ACTION_REQUIRED = {('dataset', 'restrict'): ('reason',), ('application', 'review'): ('committee_id',), ('application', 'approve'): ('approvals', 'terms', 'expires_at'), ('application', 'reject'): ('reason',), ('application', 'withdraw'): ('reason',), ('grant', 'activate'): ('starts_at', 'expires_at'), ('grant', 'revoke'): ('reason',), ('grant', 'expire'): ('expired_at',), ('grant', 'withdraw'): ('order_no', 'amount', 'purpose')}
     CREATE_ROLES = {'dataset': ('admin', 'committee'), 'application': ('admin', 'applicant'), 'grant': ('admin', 'committee')}
-    ROLE_ACTIONS = {'restrict': ('admin', 'committee'), 'publish': ('admin', 'committee'), 'submit': ('admin', 'applicant'), 'review': ('admin', 'committee'), 'approve': ('admin', 'committee'), 'reject': ('admin', 'committee'), 'withdraw': ('admin', 'applicant'), 'activate': ('admin', 'committee'), 'revoke': ('admin', 'committee'), 'expire': ('admin', 'committee')}
+    ROLE_ACTIONS = {'restrict': ('admin', 'committee'), 'publish': ('admin', 'committee'), 'submit': ('admin', 'applicant'), 'review': ('admin', 'committee'), 'approve': ('admin', 'committee'), 'reject': ('admin', 'committee'), 'withdraw': ('admin', 'applicant'), 'activate': ('admin', 'committee'), 'revoke': ('admin', 'committee'), 'expire': ('admin', 'committee'), 'withdraw': ('admin', 'applicant')}
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
