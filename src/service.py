@@ -1,8 +1,9 @@
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from .audit import AuditTrail
 from .domain import ConflictError, NotFoundError
-from .rules import RuleEngine
+from .rules import RuleEngine, apply_withdrawal
 
 
 class DomainService:
@@ -14,11 +15,23 @@ class DomainService:
     def _lookup(self, kind, field, value):
         return self.repository.find_entities(self.rules.normalize_kind(kind), field, value)
 
+    @staticmethod
+    def _enrich(entity):
+        if entity["kind"] == "grant":
+            data = entity["data"]
+            quota = data.get("quota_total") or 0
+            used = data.get("used_total") or 0
+            data["used_total"] = used
+            data["remaining_quota"] = max(quota - used, 0)
+        return entity
+
     def health(self):
         return {"status": "ok" if self.repository.ping() else "error"}
 
     def create(self, actor, kind, data, idempotency_key=None):
         kind = self.rules.normalize_kind(kind)
+        if kind == "withdrawal":
+            return self.withdraw(actor, data)
         payload = dict(data or {})
         if idempotency_key:
             existing = self.repository.get_idempotency(actor.user_id, idempotency_key)
@@ -58,16 +71,31 @@ class DomainService:
         )
         return updated
 
+    def withdraw(self, actor, data):
+        payload = dict(data or {})
+        payload = self.rules.validate_create(actor, "withdrawal", payload, self._lookup)
+        withdrawal_id = str(payload.pop("id", "") or uuid4())
+        as_of = datetime.now(timezone.utc).date().isoformat()
+        entity, _created = self.repository.record_withdrawal(
+            withdrawal_id=withdrawal_id,
+            grant_id=payload["grant_id"],
+            order_no=payload["order_no"],
+            data=payload,
+            actor=actor,
+            apply_fn=lambda grant: apply_withdrawal(grant, payload, as_of),
+        )
+        return entity
+
     def get(self, entity_id):
         entity = self.repository.get_entity(entity_id)
         if not entity:
             raise NotFoundError("entity not found: " + entity_id)
-        return entity
+        return self._enrich(entity)
 
     def list(self, kind=None, status=None):
         if kind:
             kind = self.rules.normalize_kind(kind)
-        return self.repository.list_entities(kind=kind, status=status)
+        return [self._enrich(entity) for entity in self.repository.list_entities(kind=kind, status=status)]
 
     def audit_log(self, entity_id=None):
         return self.repository.list_audit(entity_id=entity_id)

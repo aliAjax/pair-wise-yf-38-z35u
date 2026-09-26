@@ -24,7 +24,14 @@ python3 app.py --db ./data.db --port 8304
 
 ## 核心对象
 
-- `dataset`：受控数据集；`application`：访问申请；`grant`：限时数据使用凭证。
+- `dataset`：受控数据集；`application`：访问申请；`grant`：限时数据使用凭证；`withdrawal`：样本取用台账记录。
+
+## 取用台账
+
+- 新凭证创建时必须登记 `quota_total`（可取用总量）；申请人在凭证有效期内提交取用，字段为 `grant_id`、`order_no`（取用单号）、`quantity`、`purpose`。
+- 余额不足、凭证未激活/被撤销或已过期时取用不会写入，错误信息说明失效项或缺少的余量。
+- 同一 `(grant_id, order_no)` 重复提交只扣减一次（返回已存在的记录）；扣减与记录写入在单个 `BEGIN IMMEDIATE` 事务内完成，并发提交不会把余量扣成负数。
+- 成功后凭证 `used_total`（累计用量）立即更新，读取凭证时附带 `remaining_quota`（剩余余量）。没有登记总量的旧凭证按零余量处理。
 
 ## 主要接口
 

@@ -140,6 +140,80 @@ class SQLiteRepository:
             connection.close()
         return self.get_entity(entity_id)
 
+    def record_withdrawal(self, withdrawal_id, grant_id, order_no, data, actor, apply_fn):
+        """Register one withdrawal and debit the grant in a single transaction.
+
+        apply_fn(grant) performs the domain checks against the grant row read
+        under the write lock and returns (new_grant_data, audit_detail).
+        Returns (withdrawal_entity, created). A repeated (grant_id, order_no)
+        is a no-op replay and returns (existing_withdrawal, False).
+        """
+        now = utcnow()
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            duplicate = connection.execute(
+                "SELECT * FROM entities WHERE kind = 'withdrawal' "
+                "AND json_extract(data, '$.grant_id') = ? "
+                "AND json_extract(data, '$.order_no') = ?",
+                (grant_id, order_no),
+            ).fetchone()
+            if duplicate:
+                connection.commit()
+                return self._entity_from_row(duplicate), False
+            grant_row = connection.execute(
+                "SELECT * FROM entities WHERE id = ?", (grant_id,)
+            ).fetchone()
+            grant = self._entity_from_row(grant_row) if grant_row else None
+            new_grant_data, detail = apply_fn(grant)
+            connection.execute(
+                "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+                "VALUES (?, 'withdrawal', 'recorded', 1, ?, ?, ?, ?)",
+                (withdrawal_id, payload, actor.user_id, now, now),
+            )
+            cursor = connection.execute(
+                "UPDATE entities SET status = 'active', version = version + 1, data = ?, updated_at = ? "
+                "WHERE id = ? AND version = ?",
+                (
+                    json.dumps(new_grant_data, ensure_ascii=False, sort_keys=True),
+                    now,
+                    grant_id,
+                    grant["version"],
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise ConflictError("grant version changed during withdrawal")
+            connection.execute(
+                "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
+                "VALUES (?, ?, ?, 'create', NULL, 'recorded', ?, ?)",
+                (
+                    withdrawal_id,
+                    actor.user_id,
+                    actor.role,
+                    json.dumps({"kind": "withdrawal"}, ensure_ascii=False, sort_keys=True),
+                    now,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
+                "VALUES (?, ?, ?, 'withdraw', 'active', 'active', ?, ?)",
+                (
+                    grant_id,
+                    actor.user_id,
+                    actor.role,
+                    json.dumps(detail, ensure_ascii=False, sort_keys=True),
+                    now,
+                ),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(withdrawal_id), True
+
     def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
         with self._connect() as connection:
             connection.execute(

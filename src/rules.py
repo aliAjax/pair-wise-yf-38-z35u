@@ -21,6 +21,22 @@ def _validate_application(actor, data, lookup):
         raise ValidationError("purpose is required")
 
 
+def _is_positive_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+
+
+def _validate_grant(actor, data, lookup):
+    if not _is_positive_number(data.get("quota_total")):
+        raise ValidationError("quota_total must be a positive number")
+
+
+def _validate_withdrawal(actor, data, lookup):
+    if not _is_positive_number(data.get("quantity")):
+        raise ValidationError("quantity must be a positive number")
+    if not str(data.get("purpose", "")).strip():
+        raise ValidationError("purpose is required")
+
+
 def _validate_approve(actor, entity, data, lookup):
     approvals = data.get("approvals") or []
     if len(set(approvals)) < 3:
@@ -39,17 +55,58 @@ def _validate_grant_activate(actor, entity, data, lookup):
     return {"activated_by": actor.user_id}
 
 
-CUSTOM_CREATE = {'dataset': _validate_dataset, 'application': _validate_application}
+def apply_withdrawal(grant, payload, as_of):
+    """Check a withdrawal against the grant and return the new grant data.
+
+    Raises ValidationError describing the invalid item (revoked/expired
+    credential, window not open) or the missing balance.
+    """
+    if not grant:
+        raise ValidationError("grant does not exist")
+    if grant["status"] != "active":
+        raise ValidationError(
+            "grant is %s: withdrawal rejected" % grant["status"]
+        )
+    data = grant["data"]
+    starts_at = data.get("starts_at")
+    expires_at = data.get("expires_at")
+    if starts_at and str(as_of) < str(starts_at):
+        raise ValidationError("grant not yet valid: starts at %s" % starts_at)
+    if expires_at and not valid_grant_window(expires_at, as_of):
+        raise ValidationError("grant expired at %s" % expires_at)
+    # Grants created before the ledger existed have no quota: zero balance.
+    quota = data.get("quota_total") or 0
+    used = data.get("used_total") or 0
+    remaining = quota - used
+    quantity = payload["quantity"]
+    if quantity > remaining:
+        raise ValidationError(
+            "insufficient balance: requested %s but only %s remaining"
+            % (quantity, remaining)
+        )
+    updated = dict(data)
+    updated["used_total"] = used + quantity
+    detail = {
+        "grant_id": grant["id"],
+        "order_no": payload["order_no"],
+        "quantity": quantity,
+        "used_total": used + quantity,
+        "remaining_quota": remaining - quantity,
+    }
+    return updated, detail
+
+
+CUSTOM_CREATE = {'dataset': _validate_dataset, 'application': _validate_application, 'grant': _validate_grant, 'withdrawal': _validate_withdrawal}
 CUSTOM_TRANSITIONS = {('application', 'approve'): _validate_approve, ('grant', 'activate'): _validate_grant_activate}
 
 
 class RuleEngine:
-    ALIASES = {'datasets': 'dataset', 'applications': 'application', 'grants': 'grant'}
-    INITIAL_STATUS = {'dataset': 'registered', 'application': 'draft', 'grant': 'issued'}
+    ALIASES = {'datasets': 'dataset', 'applications': 'application', 'grants': 'grant', 'withdrawals': 'withdrawal'}
+    INITIAL_STATUS = {'dataset': 'registered', 'application': 'draft', 'grant': 'issued', 'withdrawal': 'recorded'}
     TRANSITIONS = {'dataset': {'restrict': (('registered',), 'restricted'), 'publish': (('restricted',), 'published')}, 'application': {'submit': (('draft',), 'submitted'), 'review': (('submitted',), 'under_review'), 'approve': (('under_review',), 'approved'), 'reject': (('under_review',), 'rejected'), 'withdraw': (('submitted', 'under_review'), 'withdrawn')}, 'grant': {'activate': (('issued',), 'active'), 'revoke': (('active',), 'revoked'), 'expire': (('active',), 'expired')}}
-    CREATE_REQUIRED = {'dataset': ('name', 'access_policy'), 'application': ('dataset_id', 'applicant_id', 'purpose'), 'grant': ('application_id', 'dataset_id', 'recipient')}
+    CREATE_REQUIRED = {'dataset': ('name', 'access_policy'), 'application': ('dataset_id', 'applicant_id', 'purpose'), 'grant': ('application_id', 'dataset_id', 'recipient', 'quota_total'), 'withdrawal': ('grant_id', 'order_no', 'quantity', 'purpose')}
     ACTION_REQUIRED = {('dataset', 'restrict'): ('reason',), ('application', 'review'): ('committee_id',), ('application', 'approve'): ('approvals', 'terms', 'expires_at'), ('application', 'reject'): ('reason',), ('application', 'withdraw'): ('reason',), ('grant', 'activate'): ('starts_at', 'expires_at'), ('grant', 'revoke'): ('reason',), ('grant', 'expire'): ('expired_at',)}
-    CREATE_ROLES = {'dataset': ('admin', 'committee'), 'application': ('admin', 'applicant'), 'grant': ('admin', 'committee')}
+    CREATE_ROLES = {'dataset': ('admin', 'committee'), 'application': ('admin', 'applicant'), 'grant': ('admin', 'committee'), 'withdrawal': ('admin', 'applicant')}
     ROLE_ACTIONS = {'restrict': ('admin', 'committee'), 'publish': ('admin', 'committee'), 'submit': ('admin', 'applicant'), 'review': ('admin', 'committee'), 'approve': ('admin', 'committee'), 'reject': ('admin', 'committee'), 'withdraw': ('admin', 'applicant'), 'activate': ('admin', 'committee'), 'revoke': ('admin', 'committee'), 'expire': ('admin', 'committee')}
 
     def normalize_kind(self, kind):
